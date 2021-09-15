@@ -1,19 +1,111 @@
-import * as sst from "@serverless-stack/resources";
+import {
+  EventBus,
+  EventField,
+  Rule,
+  RuleTargetInput,
+} from "@aws-cdk/aws-events";
+import { SfnStateMachine } from "@aws-cdk/aws-events-targets";
+import {
+  IntegrationPattern,
+  JsonPath,
+  StateMachine,
+  TaskInput,
+} from "@aws-cdk/aws-stepfunctions";
+import { SnsPublish, SqsSendMessage } from "@aws-cdk/aws-stepfunctions-tasks";
+import {
+  Api,
+  App,
+  Function,
+  Queue,
+  Stack,
+  StackProps,
+  Table,
+  TableFieldType,
+  Topic,
+} from "@serverless-stack/resources";
 
-export default class MyStack extends sst.Stack {
-  constructor(scope: sst.App, id: string, props?: sst.StackProps) {
+export default class MyStack extends Stack {
+  constructor(scope: App, id: string, props?: StackProps) {
     super(scope, id, props);
 
-    // Create the HTTP API
-    const api = new sst.Api(this, "Api", {
-      routes: {
-        "GET /": "src/lambda.handler",
+    const eventBus = new EventBus(this, "EventBus", {
+      eventBusName: "custom-event-bus",
+    });
+
+    const sayHelloFunction = new Function(this, "SayHelloFunction", {
+      environment: {
+        EVENT_BUS_NAME: eventBus.eventBusName,
+      },
+      handler: "src/sayHello.handler",
+    });
+
+    const api = new Api(this, "Api");
+
+    api.addRoutes(this, { "POST /hello/{helloFrom}": sayHelloFunction });
+
+    sayHelloFunction.attachPermissions([[eventBus, "grantPutEventsTo"]]);
+
+    const helloTable = new Table(this, "Hello", {
+      fields: {
+        helloFrom: TableFieldType.STRING,
+      },
+      primaryIndex: { partitionKey: "helloFrom" },
+    });
+
+    const queueConsumerFunction = new Function(this, "QueueConsumerFunction", {
+      environment: {
+        TABLE_NAME: helloTable.tableName,
+      },
+      handler: "src/queueConsumer.handler",
+    });
+
+    const sqsQueue = new Queue(this, "Queue", {
+      consumer: queueConsumerFunction,
+    });
+
+    const snsTopic = new Topic(this, "Topic", {
+      subscribers: ["src/topicSubscriber.handler"],
+    });
+
+    const stateMachine = new StateMachine(this, "StateMachine", {
+      definition: new SqsSendMessage(this, "SendSQSMessage", {
+        integrationPattern: IntegrationPattern.WAIT_FOR_TASK_TOKEN,
+        messageBody: TaskInput.fromObject({
+          helloFrom: TaskInput.fromJsonPathAt("$.helloFrom"),
+          taskToken: JsonPath.taskToken,
+        }),
+        queue: sqsQueue.sqsQueue,
+      }).next(
+        new SnsPublish(this, "PublishSNSMessage", {
+          message: TaskInput.fromJsonPathAt("$"),
+          topic: snsTopic.snsTopic,
+        })
+      ),
+    });
+
+    queueConsumerFunction.attachPermissions([
+      [helloTable.dynamodbTable, "grantWriteData"],
+      [stateMachine, "grantTaskResponse"],
+    ]);
+
+    const rule = new Rule(this, "Rule", {
+      eventBus: eventBus,
+      eventPattern: {
+        detailType: ["HELLO"],
+        source: ["event.custom"],
       },
     });
 
-    // Show API endpoint in output
+    rule.addTarget(
+      new SfnStateMachine(stateMachine, {
+        input: RuleTargetInput.fromObject({
+          helloFrom: EventField.fromPath("$.detail.helloFrom"),
+        }),
+      })
+    );
+
     this.addOutputs({
-      "ApiEndpoint": api.httpApi.apiEndpoint,
+      ApiEndpoint: api.httpApi.apiEndpoint,
     });
   }
 }
